@@ -33,8 +33,8 @@ def generate_synthetic_transactions(
         DataFrame of synthetic (or combined) transactions
     """
 
-    df = pd.read_csv(source_csv)
-    print(f"Loaded {len(df)} real transactions")
+    #df = pd.read_csv(source_csv)
+    #print(f"Loaded {len(df)} real transactions")
 
     # BUSINESS EXPENSE CATEGORIES & MERCHANTS
 
