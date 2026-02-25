@@ -282,6 +282,18 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
     df = df.dropna(subset=['date'])
     print(f"Clean rows after date parsing: {len(df)}")
 
+    # ✅ Ensure amount is numeric (handles "£1,234.56", "1,234.56", etc.)
+    df['amount'] = (
+        df['amount']
+        .astype(str)
+        .str.replace('£', '', regex=False)
+        .str.replace(',', '', regex=False)
+        .str.strip()
+    )
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+    df = df.dropna(subset=['amount'])
+
+    print(f"Clean rows after parsing: {len(df)}")
     # Separate income and expenses
     income_df = df[df['type'] == 'income'].copy()
     expense_df = df[df['type'] == 'expense'].copy()
