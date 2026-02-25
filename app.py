@@ -4,6 +4,16 @@ from utils import ingest_data
 from rag import query_financial_chatbot
 import chromadb
 
+# In app.py, before loading collection
+import os
+if not os.path.exists('synthetic_transactions.csv'):
+    generate_synthetic_transactions(
+        num_transactions=10000,
+        years=2,
+        output_file=csv_path,
+        combine=False  # no real data to combine with
+    )
+    
 # Page config
 st.set_page_config(page_title="Financial Coach", layout="wide")
 
