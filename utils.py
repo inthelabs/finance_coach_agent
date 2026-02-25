@@ -476,7 +476,7 @@ def ingest_data(csv_path: str = 'synthetic_transactions.csv'):
         )
     
     print("Loading data...")
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path,on_bad_lines='skip')
     
     print("Creating chunks...")
     chunks = create_chunks(df)
