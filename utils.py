@@ -7,7 +7,7 @@ import random
 import chromadb
 from chromadb import PersistentClient
 from sentence_transformers import SentenceTransformer
-
+import os
 
 def generate_synthetic_transactions(
     num_transactions: int = 10000,
@@ -465,6 +465,15 @@ def embed_and_store(chunks: list[dict], collection_name: str = 'financial_data')
 #the orchestration happens here
 def ingest_data(csv_path: str = 'synthetic_transactions.csv'):
     
+    # Generate synthetic data if CSV doesn't exist
+    if not os.path.exists(csv_path):
+        print("No CSV found - generating synthetic transactions...")
+        generate_synthetic_transactions(
+            num_transactions=10000,
+            years=2,
+            output_file=csv_path,
+            combine=False  # no real data to combine with
+        )
     
     print("Loading data...")
     df = pd.read_csv(csv_path)
