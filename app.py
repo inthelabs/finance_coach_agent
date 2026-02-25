@@ -7,6 +7,7 @@ import chromadb
 # In app.py, before loading collection
 import os
 if not os.path.exists('synthetic_transactions.csv'):
+    csv_path = 'synthetic_transactions.csv'
     generate_synthetic_transactions(
         num_transactions=10000,
         years=2,
