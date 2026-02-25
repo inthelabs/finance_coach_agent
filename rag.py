@@ -1,6 +1,6 @@
 #all the retrival code and generation of the augmented prompt that is then feed to LLM
 from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama import OllamaLLM
+#from langchain_ollama import OllamaLLM
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 import chromadb
