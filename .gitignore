@@ -20,3 +20,6 @@ mymlprof/
 
 # OS files
 .DS_Store
+
+#COLLABS
+.ipynb

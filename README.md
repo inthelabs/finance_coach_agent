@@ -1,6 +1,6 @@
-# Financial Coach — RAG-Powered Business Financial Advisor
+# Financial Coach: RAG-Powered Business Financial Advisor
 
-A conversational AI financial coach built with **LangChain**, **ChromaDB**, and **Google Gemini**, powered by a **RAG pipeline** that ingests synthetic business transaction data and answers natural language financial queries with grounded, context-aware advice.
+A conversational AI financial coach built with **LangChain**, **ChromaDB**, and **Google Gemini**, powered by a **RAG pipeline** that ingests (synthetic) business transaction data and answers natural language financial queries with grounded, context-aware advice.
 
 ---
 
