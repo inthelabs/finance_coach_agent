@@ -10,7 +10,6 @@ from sentence_transformers import SentenceTransformer
 
 
 def generate_synthetic_transactions(
-    source_csv: str = 'transactions.csv',
     num_transactions: int = 10000,
     years: int = 2,
     output_file: str = 'synthetic_transactions.csv',
@@ -214,16 +213,16 @@ def generate_synthetic_transactions(
     print(f"\n✓ Saved synthetic data → {output_file}")
     print(f"  Total synthetic transactions: {len(synthetic_df)}")
 
-    if combine:
-        # Add type column to original if missing
-        if 'type' not in df.columns:
-            df['type'] = 'expense'
-        combined_df = pd.concat([df, synthetic_df], ignore_index=True)
-        combined_df = combined_df.sort_values('date').reset_index(drop=True)
-        combined_df.to_csv('combined_transactions.csv', index=False)
-        print(f"✓ Combined dataset saved → combined_transactions.csv")
-        print(f"  Total transactions: {len(combined_df)}")
-        return combined_df
+    # if combine:
+    #     # Add type column to original if missing
+    #     if 'type' not in df.columns:
+    #         df['type'] = 'expense'
+    #     combined_df = pd.concat([df, synthetic_df], ignore_index=True)
+    #     combined_df = combined_df.sort_values('date').reset_index(drop=True)
+    #     combined_df.to_csv('combined_transactions.csv', index=False)
+    #     print(f"✓ Combined dataset saved → combined_transactions.csv")
+    #     print(f"  Total transactions: {len(combined_df)}")
+    #     return combined_df
 
     return synthetic_df
 
@@ -465,6 +464,8 @@ def embed_and_store(chunks: list[dict], collection_name: str = 'financial_data')
 
 #the orchestration happens here
 def ingest_data(csv_path: str = 'synthetic_transactions.csv'):
+    
+    
     print("Loading data...")
     df = pd.read_csv(csv_path)
     
