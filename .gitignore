@@ -25,3 +25,5 @@ mymlprof/
 .ipynb
 
 requirements_bk.txt
+
+.devcontainer
