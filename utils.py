@@ -277,8 +277,11 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
     """
     
     # Ensure date column is datetime
-    df['date'] = pd.to_datetime(df['date'])
-    
+    #df['date'] = pd.to_datetime(df['date'])
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date'])
+    print(f"Clean rows after date parsing: {len(df)}")
+
     # Separate income and expenses
     income_df = df[df['type'] == 'income'].copy()
     expense_df = df[df['type'] == 'expense'].copy()
