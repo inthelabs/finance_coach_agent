@@ -1,6 +1,6 @@
 import streamlit as st
 from ingest import main as run_ingest
-from utils import ingest_data
+from utils import ingest_data, generate_synthetic_transactions
 from rag import query_financial_chatbot
 import chromadb
 
