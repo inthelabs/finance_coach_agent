@@ -22,7 +22,7 @@ mymlprof/
 .DS_Store
 
 #COLLABS
-.ipynb
+*.ipynb
 
 requirements_bk.txt
 
