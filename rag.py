@@ -1,6 +1,5 @@
-#all the retrival code and generation of the augmented prompt that is then feed to LLM
+# Retrieval code and generation of the augmented prompt fed to the LLM.
 from langchain_core.output_parsers import StrOutputParser
-#from langchain_ollama import OllamaLLM
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 import chromadb
@@ -15,6 +14,7 @@ print("CWD:", os.getcwd())
 print("GOOGLE_API_KEY present?:", bool(os.getenv("GOOGLE_API_KEY")))
 print("GOOGLE_API_KEY length:", len(os.getenv("GOOGLE_API_KEY") or ""))
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+
 MONTHS = {
     "jan": 1, "january": 1,
     "feb": 2, "february": 2,
@@ -28,14 +28,77 @@ MONTHS = {
     "oct": 10, "october": 10,
     "nov": 11, "november": 11,
     "dec": 12, "december": 12,
-}   
+}
 
-# system_prompt = """
-# You are a financial advisor with expertise in behavioral psychology and financial habits.
-# Analyze spending patterns and give personalized, actionable advice.
-# If asked "can I afford X", analyze their data and suggest strategies.
+# Words that suggest a message is a pronoun-laden fragment referencing prior context.
+FRAGMENT_PRONOUNS = {'it', 'that', 'he', 'she', 'they', 'this', 'those', 'them'}
 
-# """
+# Single-word messages that carry no standalone financial meaning.
+STANDALONE_AFFIRMATIONS = {'yes', 'no', 'yeah', 'ok', 'okay', 'sure', 'nope', 'yep'}
+
+# Keywords that indicate a clearly self-contained financial question.
+FINANCIAL_KEYWORDS = {
+    'profit', 'loss', 'revenue', 'income', 'expense', 'expenses', 'spend',
+    'spending', 'month', 'monthly', 'quarter', 'quarterly', 'week', 'weekly',
+    'afford', 'cashflow', 'cash', 'trend', 'category', 'categories',
+    'salary', 'hire', 'budget', 'cost', 'costs', 'sales', 'net', 'p&l',
+    'invoice', 'tax', 'vat', 'employee', 'payroll', 'advertising',
+}
+
+
+def is_fragment_or_ambiguous(user_message: str) -> bool:
+    """
+    Returns True if the message is too short or ambiguous to stand alone as a
+    financial query — i.e. it needs prior conversation context to be understood.
+
+    Logic (in order):
+    1. Single-word affirmation/negation → True
+    2. More than 6 words → clearly standalone → False
+    3. Contains a financial keyword → clearly standalone → False
+    4. Fewer than 4 words AND contains a referential pronoun → True (fragment)
+    5. Otherwise → False
+    """
+    words = user_message.strip().lower().split()
+
+    # Rule 1: bare affirmation with no content
+    if len(words) == 1 and words[0] in STANDALONE_AFFIRMATIONS:
+        return True
+
+    # Rule 2: long enough to be self-contained
+    if len(words) > 6:
+        return False
+
+    # Rule 3: contains a financial domain keyword — treat as standalone
+    if FINANCIAL_KEYWORDS.intersection(set(words)):
+        return False
+
+    # Rule 4: short fragment with a referential pronoun
+    if len(words) < 4 and FRAGMENT_PRONOUNS.intersection(set(words)):
+        return True
+
+    return False
+
+
+# ── LLM & chains ──────────────────────────────────────────────────────────────
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    google_api_key=GOOGLE_API_KEY,
+    streaming=True
+)
+
+# Rewrites short/ambiguous follow-ups into fully self-contained questions.
+rewriter_prompt = ChatPromptTemplate.from_template(
+    "You are a query resolver. Given a conversation history and a short follow-up "
+    "message, rewrite the follow-up as a fully self-contained question by resolving "
+    "any pronouns or references to earlier turns. "
+    "Return ONLY the rewritten question — no explanation, no punctuation changes beyond "
+    "what is necessary.\n\n"
+    "Conversation History:\n{history}\n\n"
+    "Follow-up Message: {query}\n\n"
+    "Rewritten Question:"
+)
+rewriter_chain = rewriter_prompt | llm | StrOutputParser()
 
 system_prompt = """
 You are a financial advisor with expertise in behavioral psychology and financial habits.
@@ -45,9 +108,11 @@ Rules:
 - Be specific, practical, and data-backed. Use £ amounts when available.
 - If asked "can I afford X", estimate affordability using income, expenses, and net P&L in the context, and suggest strategies.
 """
-prompt_template = ChatPromptTemplate.from_template(
-system_prompt + """
 
+# {history} is an optional block — pass an empty string when there is no prior conversation.
+prompt_template = ChatPromptTemplate.from_template(
+    system_prompt + """
+{history}
 Financial Context:
 {context}
 
@@ -56,33 +121,73 @@ User Query: {query}
 Advice:"""
 )
 
-llm = ChatGoogleGenerativeAI(
-model="gemini-2.0-flash",
-google_api_key=GOOGLE_API_KEY,
-streaming=True
-)
-
 chain = prompt_template | llm | StrOutputParser()
 
 
+# ── History helpers ────────────────────────────────────────────────────────────
+
+def format_history_for_rewriter(chat_history: list, last_n: int = 4) -> str:
+    """Formats the most recent `last_n` messages as 'Role: content' lines."""
+    recent = chat_history[-last_n:]
+    lines = []
+    for msg in recent:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {msg['content']}")
+    return "\n".join(lines)
+
+
+def format_history_for_prompt(chat_history: list, last_n: int = 8) -> str:
+    """
+    Returns a labelled 'Conversation History:' block for the main prompt,
+    or an empty string when there is no prior history.
+    """
+    if not chat_history:
+        return ""
+    recent = chat_history[-last_n:]
+    lines = []
+    for msg in recent:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {msg['content']}")
+    return "Conversation History:\n" + "\n".join(lines) + "\n"
+
+
+def resolve_query_with_history(user_query: str, chat_history: list) -> str:
+    """
+    If `user_query` is a fragment or ambiguous reference (per `is_fragment_or_ambiguous`),
+    uses the LLM rewriter to produce a self-contained question using the last 4 turns
+    of `chat_history` as context.  Otherwise returns `user_query` unchanged.
+
+    Always prints both the original and resolved queries for debugging.
+    """
+    print(f"[resolve] Original query : {user_query!r}")
+
+    if not chat_history or not is_fragment_or_ambiguous(user_query):
+        print("[resolve] Resolved query  : (unchanged — standalone or no history)")
+        return user_query
+
+    history_text = format_history_for_rewriter(chat_history, last_n=4)
+    resolved_query = rewriter_chain.invoke({"history": history_text, "query": user_query}).strip()
+
+    print(f"[resolve] Resolved query  : {resolved_query!r}")
+    return resolved_query
+
+
+# ── Period / granularity helpers ───────────────────────────────────────────────
+
 def infer_granularity(user_query: str) -> str:
     q = user_query.lower()
-    
-    if 'quarter' in q or re.search(r"\bq[1-4]\b",q):
+
+    if 'quarter' in q or re.search(r"\bq[1-4]\b", q):
         return 'quarterly'
-    
+
     if 'weekly' in q or 'week' in q or 'last 7 days' in q:
         return 'weekly'
-    
-    # monthly intent (default)
-    # month names or "month"/"monthly" or YYYY-MM
-    if 'month' in q or 'monthly' in q or re.search(r"\b20\d{2}-\d{2}\b",q):
+
+    if 'month' in q or 'monthly' in q or re.search(r"\b20\d{2}-\d{2}\b", q):
         return 'monthly'
-    
-    #otherwise default to monthly as it is usually the safest. 
+
     return 'monthly'
 
-import re
 
 def normalize_year(y: int) -> int:
     # 00–79 -> 2000s, 80–99 -> 1900s
@@ -90,33 +195,27 @@ def normalize_year(y: int) -> int:
         return 2000 + y if y <= 79 else 1900 + y
     return y
 
+
 def extract_month_period(user_query: str) -> str | None:
     q = user_query.strip().lower()
 
     # 1) YYYY-MM
     m = re.search(r"\b(20\d{2})-(0?[1-9]|1[0-2])\b", q)
     if m:
-        year = int(m.group(1))
-        month = int(m.group(2))
-        return f"{year:04d}-{month:02d}"
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
 
-    # 2) MM/YYYY or MM/YY (also handles 1/26)
+    # 2) MM/YYYY or MM/YY
     m = re.search(r"\b(0?[1-9]|1[0-2])/(20\d{2}|\d{2})\b", q)
     if m:
-        month = int(m.group(1))
-        year = normalize_year(int(m.group(2)))
-        return f"{year:04d}-{month:02d}"
+        return f"{normalize_year(int(m.group(2))):04d}-{int(m.group(1)):02d}"
 
     # 3) MonthName + Year (Jan26, Jan 2026, January '26)
     m = re.search(r"\b([a-z]{3,9})[\s\-']*(20\d{2}|\d{2})\b", q)
-    if m:
-        mon_txt = m.group(1)
-        if mon_txt in MONTHS:
-            month = MONTHS[mon_txt]
-            year = normalize_year(int(m.group(2)))
-            return f"{year:04d}-{month:02d}"
+    if m and m.group(1) in MONTHS:
+        return f"{normalize_year(int(m.group(2))):04d}-{MONTHS[m.group(1)]:02d}"
 
     return None
+
 
 def extract_quarter_period(user_query: str) -> str | None:
     q = user_query.strip().lower()
@@ -125,11 +224,12 @@ def extract_quarter_period(user_query: str) -> str | None:
         return None
 
     if m.re.pattern.startswith("\\b(20"):
-        year = int(m.group(1)); quarter = int(m.group(2))
+        year, quarter = int(m.group(1)), int(m.group(2))
     else:
-        quarter = int(m.group(1)); year = int(m.group(2))
+        quarter, year = int(m.group(1)), int(m.group(2))
 
     return f"{year}Q{quarter}"
+
 
 def extract_single_period(user_query: str, granularity: str) -> str | None:
     if granularity == "monthly":
@@ -137,6 +237,8 @@ def extract_single_period(user_query: str, granularity: str) -> str | None:
     if granularity == "quarterly":
         return extract_quarter_period(user_query)
     return None
+
+
 def extract_last_n(user_query: str) -> tuple[str, int] | None:
     q = user_query.lower()
     m = re.search(r"\blast\s+(\d+)\s+(months|month)\b", q)
@@ -147,6 +249,7 @@ def extract_last_n(user_query: str) -> tuple[str, int] | None:
         return ("quarterly", int(m.group(1)))
     return None
 
+
 def extract_period(user_query: str):
     m = re.search(r"\b(20\d{2}-\d{2})\b", user_query)
     if m:
@@ -156,32 +259,18 @@ def extract_period(user_query: str):
         return f"{q.group(1)}Q{q.group(2)}"
     return None
 
-def format_context(results) -> str:
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
 
-    #print(f"Similarity Search: {docs}")
-    #print(f"Similarity Search Metas: {metas}")
-    
-    blocks = []
-    for doc, meta in zip(docs, metas):
-        period = meta.get("period", "unknown")
-        chunk_type = meta.get("chunk_type", "unknown")
-        blocks.append(f"[{chunk_type} | {period}]\n{doc}".strip())
-        
-    #from datetime import datetime
-    #blocks += f"For time reference, today's date and time is: {datetime.now()}"
-    
-    return "\n\n---\n\n".join(blocks)
-
+# ── Retrieval ──────────────────────────────────────────────────────────────────
 
 def last_n_months(latest_date_iso: str, n: int) -> list[str]:
     latest = pd.Timestamp(latest_date_iso).to_period("M")
     return [str(latest - i) for i in reversed(range(n))]
 
+
 def last_n_quarters(latest_date_iso: str, n: int) -> list[str]:
     latest = pd.Timestamp(latest_date_iso).to_period("Q")
     return [str(latest - i) for i in reversed(range(n))]
+
 
 def get_chunks_by_periods(collection, chunk_type: str, periods: list[str]):
     docs_metas = []
@@ -192,90 +281,93 @@ def get_chunks_by_periods(collection, chunk_type: str, periods: list[str]):
                 {"period": p}
             ]}
         )
-        docs = got.get("documents", [])
-        metas = got.get("metadatas", [])
-        for d, m in zip(docs, metas):
+        for d, m in zip(got.get("documents", []), got.get("metadatas", [])):
             docs_metas.append((d, m))
     return docs_metas
 
-def retrive(user_query,embedding_model, collection, top_k: int=5):
- 
-    #load meta data so we can retrive the latest data
+
+def retrive(user_query, embedding_model, collection, top_k: int = 5):
     meta = load_index_meta()
     latest_date = meta['latest_date']
-    
-    #before we use similarity search lets first infer the time period of the users request
+
     time_period = infer_granularity(user_query=user_query)
-    
-    #1) deterministic: last N months/quarters
-    req = extract_last_n(user_query=user_query) #returns ('monthly',6) or ('quarterly,3) or None.
+
+    # 1) Deterministic: last N months/quarters
+    req = extract_last_n(user_query=user_query)
     if req:
-        g,n = req
-        if g == 'monthly':
-            periods = last_n_months(latest_date_iso=latest_date,n=n)
-        else:
-            periods = last_n_quarters(latest_date_iso=latest_date,n=n)
-        
-        docs_metas = get_chunks_by_periods(collection=collection,chunk_type=g,periods=periods)
-        print(f'Deterministic Retrival: last N {periods}')
+        g, n = req
+        periods = last_n_months(latest_date, n) if g == 'monthly' else last_n_quarters(latest_date, n)
+        docs_metas = get_chunks_by_periods(collection, chunk_type=g, periods=periods)
+        print(f'Deterministic Retrieval: last N {periods}')
         return docs_metas, {"mode": "exact_window", "latest_date": latest_date, "periods": periods}
 
-    #2) Deterministic: get an extract period
-    period = extract_single_period(user_query=user_query,granularity=time_period)
+    # 2) Deterministic: exact named period
+    period = extract_single_period(user_query=user_query, granularity=time_period)
     if period:
         docs_metas = get_chunks_by_periods(collection, time_period, [period])
-        print(f'Deterministic Retrival: get exact period {period}')
-        
+        print(f'Deterministic Retrieval: exact period {period}')
         return docs_metas, {"mode": "exact_period", "latest_date": latest_date, "periods": [period]}
 
-    #3) Similarity Search using Embeddings
+    # 3) Semantic similarity search
     query_embedding = embedding_model.encode(user_query)
-    #get the top 5 similar chunks from Chroma
     results = collection.query(
         query_embeddings=[query_embedding.tolist()],
         n_results=top_k,
         where={"chunk_type": time_period}
     )
-    
-    # if we've gotten here then it is using Semantic search. Convert into (doc, meta) pairs
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
     docs_metas = list(zip(docs, metas))
-    print(f'Similarity Search Retrival')
-    
+    print('Semantic Similarity Retrieval')
     return docs_metas, {"mode": "semantic", "latest_date": latest_date}
 
-def format_context_from_pairs(docs_metas):
-    blocks = []
-    for doc, meta in docs_metas:
-        blocks.append(f"[{meta.get('chunk_type')} | {meta.get('period')}]\n{doc}".strip())
+
+def format_context_from_pairs(docs_metas) -> str:
+    blocks = [
+        f"[{meta.get('chunk_type')} | {meta.get('period')}]\n{doc}".strip()
+        for doc, meta in docs_metas
+    ]
     return "\n\n---\n\n".join(blocks)
 
-def query_financial_chatbot(user_query,embedding_model,collection):
 
-    results, extra_info = retrive(user_query,embedding_model,collection)
-    
-    #build the conext string that will be then passed to the llm
-    # context = ""
-    # for doc in results['documents'][0]:
-    #     context += doc +"\n---\n"
-    context = format_context_from_pairs(docs_metas=results)
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def query_financial_chatbot(user_query, embedding_model, collection, chat_history: list = []):
+    """
+    Non-streaming query.  Resolves ambiguous follow-ups using chat_history before
+    retrieval, and injects formatted history into the LLM prompt.
+    """
+    resolved_query = resolve_query_with_history(user_query, chat_history)
+
+    docs_metas, extra_info = retrive(resolved_query, embedding_model, collection)
+
+    context = format_context_from_pairs(docs_metas)
     context = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n\n" + context
 
-    response = chain.invoke({"context":context, "query":user_query})
+    history_block = format_history_for_prompt(chat_history)
 
-    return response, results, extra_info
+    response = chain.invoke({"context": context, "query": resolved_query, "history": history_block})
+    return response, docs_metas, extra_info
 
-def stream_financial_chatbot(user_query, embedding_model, collection):
-    docs_metas, extra_info = retrive(user_query, embedding_model, collection)
 
-    context = format_context_from_pairs(docs_metas=docs_metas)
+def stream_financial_chatbot(user_query, embedding_model, collection, chat_history: list = []):
+    """
+    Streaming query.  Same resolution and history injection as query_financial_chatbot.
+    Yields (token, docs_metas, extra_info) on each streamed chunk.
+    """
+    resolved_query = resolve_query_with_history(user_query, chat_history)
+
+    docs_metas, extra_info = retrive(resolved_query, embedding_model, collection)
+
+    context = format_context_from_pairs(docs_metas)
     context = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n\n" + context
 
-    # stream tokens from the chain
-    for chunk in chain.stream({"context": context, "query": user_query}):
-        yield chunk, docs_metas, extra_info
-        
-if __name__ == "__main__":    
+    history_block = format_history_for_prompt(chat_history)
+
+    for token in chain.stream({"context": context, "query": resolved_query, "history": history_block}):
+        yield token, docs_metas, extra_info
+
+
+if __name__ == "__main__":
     print("rag.py imports ✓")
     print("Chain initialised ✓")

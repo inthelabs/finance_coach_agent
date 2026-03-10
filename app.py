@@ -15,7 +15,7 @@ if not os.path.exists('synthetic_transactions.csv') or RESET_DB:
         output_file=csv_path,
         combine=False  # no real data to combine with
     )
-    
+
 
 # Page config
 st.set_page_config(page_title="Financial Coach", layout="wide")
@@ -51,47 +51,47 @@ user_input = st.chat_input("Ask about your finances...")
 if user_input:
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": user_input})
-    
+
     # Display user message
     with st.chat_message("user"):
         st.markdown(user_input)
-    
-    # Get response from RAG system
+
+    # Get response from RAG system (non-streaming — used to populate session state)
     with st.spinner("Analyzing your data..."):
         response, results, extra_info = query_financial_chatbot(
-            user_input, 
-            embedding_model, 
-            collection
+            user_input,
+            embedding_model,
+            collection,
+            chat_history=st.session_state.messages
         )
-    
+
     # Extract citations from retrieved chunks
     citations = [
-    f"[{meta.get('chunk_type')} | {meta.get('period')}]\n{doc}"
-    for (doc, meta) in results
+        f"[{meta.get('chunk_type')} | {meta.get('period')}]\n{doc}"
+        for (doc, meta) in results
     ] if results else []
 
     # Add assistant response to chat history
     st.session_state.messages.append({
-        "role": "assistant", 
+        "role": "assistant",
         "content": response,
         "citations": citations
     })
-    
-    # Display assistant message with citations
+
+    # Display assistant message with streaming
     with st.chat_message("assistant"):
         st.caption(f"Mode: {extra_info['mode']}, Periods: {extra_info.get('periods', [])}")
-        # st.markdown(response)
-        # with st.expander("📊 Data Sources"):
-        #     for i, citation in enumerate(citations, 1):
-        #         st.markdown(f"**Source {i}:**\n{citation}")
-        # placeholder that we will keep updating
         placeholder = st.empty()
         full_text = ""
         final_results = None
         final_extra = None
 
-        # stream
-        for token, docs_metas, extra_info in stream_financial_chatbot(user_input, embedding_model, collection):
+        for token, docs_metas, extra_info in stream_financial_chatbot(
+            user_input,
+            embedding_model,
+            collection,
+            chat_history=st.session_state.messages
+        ):
             full_text += token
             placeholder.markdown(full_text)
             final_results = docs_metas
