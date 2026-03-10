@@ -1,20 +1,22 @@
 import streamlit as st
 from ingest import main as run_ingest
 from utils import ingest_data, generate_synthetic_transactions
-from rag import query_financial_chatbot
+from rag import query_financial_chatbot, stream_financial_chatbot
 import chromadb
 
+RESET_DB = True
 # In app.py, before loading collection
 import os
-if not os.path.exists('synthetic_transactions.csv'):
+if not os.path.exists('synthetic_transactions.csv') or RESET_DB:
     csv_path = 'synthetic_transactions.csv'
     generate_synthetic_transactions(
-        num_transactions=10000,
-        years=2,
+        num_transactions=100000,
+        years=15,
         output_file=csv_path,
         combine=False  # no real data to combine with
     )
     
+
 # Page config
 st.set_page_config(page_title="Financial Coach", layout="wide")
 
@@ -27,7 +29,7 @@ if "messages" not in st.session_state:
 
 if "collection" not in st.session_state:
     with st.spinner("Loading financial data..."):
-        collection, embedding_model = ingest_data()
+        collection, embedding_model = ingest_data(reset_db=RESET_DB)
         st.session_state.collection = collection
         st.session_state.embedding_model = embedding_model
 
@@ -56,15 +58,18 @@ if user_input:
     
     # Get response from RAG system
     with st.spinner("Analyzing your data..."):
-        response, results = query_financial_chatbot(
+        response, results, extra_info = query_financial_chatbot(
             user_input, 
             embedding_model, 
             collection
         )
     
     # Extract citations from retrieved chunks
-    citations = results['documents'][0] if results['documents'] else []
-    
+    citations = [
+    f"[{meta.get('chunk_type')} | {meta.get('period')}]\n{doc}"
+    for (doc, meta) in results
+    ] if results else []
+
     # Add assistant response to chat history
     st.session_state.messages.append({
         "role": "assistant", 
@@ -74,7 +79,34 @@ if user_input:
     
     # Display assistant message with citations
     with st.chat_message("assistant"):
-        st.markdown(response)
+        st.caption(f"Mode: {extra_info['mode']}, Periods: {extra_info.get('periods', [])}")
+        # st.markdown(response)
+        # with st.expander("📊 Data Sources"):
+        #     for i, citation in enumerate(citations, 1):
+        #         st.markdown(f"**Source {i}:**\n{citation}")
+        # placeholder that we will keep updating
+        placeholder = st.empty()
+        full_text = ""
+        final_results = None
+        final_extra = None
+
+        # stream
+        for token, docs_metas, extra_info in stream_financial_chatbot(user_input, embedding_model, collection):
+            full_text += token
+            placeholder.markdown(full_text)
+            final_results = docs_metas
+            final_extra = extra_info
+
+        # show caption after stream finishes
+        if final_extra:
+            st.caption(f"Mode: {final_extra['mode']}, Periods: {final_extra.get('periods', [])}")
+
+        # citations after stream finishes
+        citations = [
+            f"[{meta.get('chunk_type')} | {meta.get('period')}]\n{doc}"
+            for (doc, meta) in (final_results or [])
+        ]
+
         with st.expander("📊 Data Sources"):
-            for i, citation in enumerate(citations, 1):
-                st.markdown(f"**Source {i}:**\n{citation}")
+            for i, c in enumerate(citations, 1):
+                st.markdown(f"**Source {i}:**\n{c}")

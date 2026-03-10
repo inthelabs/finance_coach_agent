@@ -7,15 +7,37 @@ import random
 import chromadb
 from chromadb import PersistentClient
 from sentence_transformers import SentenceTransformer
+import json
+from pathlib import Path
 import os
+
+INDEX_META_PATH = Path("./chroma/index_meta.json")
+CHROMA_PATH = "./chroma"
+COLLECTION_NAME = "financial_data"
+
+def reset_chroma_db():
+    """
+    Deletes the existing Chroma database and recreates a clean one.
+    Use this during development when the schema or data changes.
+    """
+    if Path(CHROMA_PATH).exists():
+        print("⚠️ Resetting Chroma database...")
+        shutil.rmtree(CHROMA_PATH)
+        print("✓ Chroma database deleted")
+
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+
+    print("✓ New Chroma collection created")
+    return collection
 
 def generate_synthetic_transactions(
     num_transactions: int = 10000,
     years: int = 2,
     output_file: str = 'synthetic_transactions.csv',
     combine: bool = True,
-    annual_revenue_min: float = 500000,
-    annual_revenue_max: float = 1300000
+    annual_revenue_min: float = 5000000,
+    annual_revenue_max: float = 9000000
 ) -> pd.DataFrame:
     """
     Generate synthetic business transactions including expenses and Shopify income.
@@ -451,16 +473,25 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
     return chunks
 
 
-def embed_and_store(chunks: list[dict], collection_name: str = 'financial_data'):
+def embed_and_store(chunks: list[dict], collection_name: str = 'financial_data', reset_db : bool = False):
     """
     Embed all chunks and store in Chroma vector DB with metadata.
     """
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    client_db = chromadb.PersistentClient(path='./chroma') #chromadb.Client()
+    # Create Chroma client
+    client_db = chromadb.PersistentClient(path='./chroma')
+
+    if reset_db:
+        try:
+            client_db.delete_collection(name=collection_name)
+            print("⚠️ Existing collection deleted")
+        except Exception:
+            pass
+
     collection = client_db.get_or_create_collection(name=collection_name) #create_collection(name=collection_name)
     
     # If collection already has data, skip re-embedding
-    if collection.count() > 0:
+    if collection.count() > 0 and not reset_db:
         print(f"✓ Collection already exists with {collection.count()} chunks - skipping embedding")
         return collection, embedding_model
     
@@ -477,15 +508,37 @@ def embed_and_store(chunks: list[dict], collection_name: str = 'financial_data')
     print(f"✓ Stored {len(chunks)} chunks in vector database")
     return collection, embedding_model
 
+def save_index_meta(df: pd.DataFrame):
+    # make sure date is parsed
+    d = pd.to_datetime(df["date"], errors="coerce").dropna()
+    
+    latest_date = d.max().date().isoformat()
+    months = sorted(d.dt.to_period("M").astype(str).unique().tolist())
+    quarters = sorted(d.dt.to_period("Q").astype(str).unique().tolist())
+    weeks = sorted(d.dt.to_period("W").astype(str).unique().tolist())
+
+    meta = {
+        "latest_date": latest_date,
+        "available_months": months,
+        "available_quarters": quarters,
+        "available_weeks": weeks,
+    }
+    INDEX_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+    INDEX_META_PATH.write_text(json.dumps(meta, indent=2))
+
+def load_index_meta():
+    return json.loads(INDEX_META_PATH.read_text())
+
+
 #the orchestration happens here
-def ingest_data(csv_path: str = 'synthetic_transactions.csv'):
+def ingest_data(csv_path: str = 'synthetic_transactions.csv',reset_db: bool = False):
     
     # Generate synthetic data if CSV doesn't exist
-    if not os.path.exists(csv_path):
+    if not os.path.exists(csv_path) or reset_db:
         print("No CSV found - generating synthetic transactions...")
         generate_synthetic_transactions(
-            num_transactions=10000,
-            years=2,
+            num_transactions=100000,
+            years=15,
             output_file=csv_path,
             combine=False  # no real data to combine with
         )
@@ -493,11 +546,14 @@ def ingest_data(csv_path: str = 'synthetic_transactions.csv'):
     print("Loading data...")
     df = pd.read_csv(csv_path,on_bad_lines='skip')
     
+    #save the meta data regarding the number of months, etc.
+    save_index_meta(df)
+    
     print("Creating chunks...")
     chunks = create_chunks(df)
     
     print("Embedding and storing...")
-    collection, embedding_model = embed_and_store(chunks)
+    collection, embedding_model = embed_and_store(chunks=chunks,collection_name=COLLECTION_NAME,reset_db=reset_db)
     
     print("✓ Ingestion complete")
     return collection, embedding_model
