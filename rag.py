@@ -55,6 +55,10 @@ REFERENTIAL_PHRASES = {
     "those quarters",
 }
 
+def is_referential_message(user_message: str) -> bool:
+    msg = " ".join(user_message.strip().lower().split())
+    return any(p in msg for p in REFERENTIAL_PHRASES)
+
 # Single-word messages that carry no standalone financial meaning.
 STANDALONE_AFFIRMATIONS = {'yes', 'no', 'yeah', 'ok', 'okay', 'sure', 'nope', 'yep'}
 
@@ -623,7 +627,7 @@ def summarize_for_context(docs_metas: list[tuple[str, dict]], max_items: int = 6
     return head + middle + tail
 
 
-def retrive(user_query, embedding_model, collection, top_k: int = 5):
+def retrive(user_query, embedding_model, collection, top_k: int = 5, prior_context: dict | None = None):
     meta = load_index_meta()
     latest_date = meta['latest_date']
     available_months = meta.get("available_months", [])
@@ -976,6 +980,40 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
         period_list = periods_in_range(time_window["start"], time_window["end"], time_period)
         where_clause = {"$and": [{"chunk_type": time_period}, {"period": {"$in": period_list}}]}
 
+    # Context carryover: if this is a referential follow-up with no extracted periods/window,
+    # reuse the prior retrieval window to avoid unscoped semantic search.
+    if (not explicit_periods) and (not time_window) and prior_context and is_referential_message(user_query):
+        prior_periods = prior_context.get("periods") or []
+        prior_tw = prior_context.get("time_window")
+        prior_gran = prior_context.get("granularity") or time_period
+        if prior_periods:
+            docs_metas = get_chunks_by_periods(collection, chunk_type=prior_gran, periods=prior_periods)
+            return docs_metas, {
+                "mode": "context_carryover",
+                "intent": intent,
+                "latest_date": latest_date,
+                "granularity": prior_gran,
+                "periods": prior_periods,
+                "time_window": prior_tw,
+                "computed": None,
+                "answer_granularity": prior_context.get("answer_granularity") or prior_gran,
+                "expand_to_subperiods": prior_context.get("expand_to_subperiods") or False,
+            }
+        if prior_tw:
+            periods = periods_in_range(prior_tw["start"], prior_tw["end"], prior_gran)
+            docs_metas = get_chunks_by_periods(collection, chunk_type=prior_gran, periods=periods)
+            return summarize_for_context(docs_metas, max_items=6), {
+                "mode": "context_carryover",
+                "intent": intent,
+                "latest_date": latest_date,
+                "granularity": prior_gran,
+                "periods": [],
+                "time_window": prior_tw,
+                "computed": None,
+                "answer_granularity": prior_context.get("answer_granularity") or prior_gran,
+                "expand_to_subperiods": False,
+            }
+
     print("Semantic Similarity Retrieval")
     query_embedding = embedding_model.encode(user_query)
     results = collection.query(
@@ -1011,14 +1049,14 @@ def format_context_from_pairs(docs_metas) -> str:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def query_financial_chatbot(user_query, embedding_model, collection, chat_history: list = []):
+def query_financial_chatbot(user_query, embedding_model, collection, chat_history: list = [], prior_context: dict | None = None):
     """
     Non-streaming query.  Resolves ambiguous follow-ups using chat_history before
     retrieval, and injects formatted history into the LLM prompt.
     """
     resolved_query = resolve_query_with_history(user_query, chat_history)
 
-    docs_metas, extra_info = retrive(resolved_query, embedding_model, collection)
+    docs_metas, extra_info = retrive(resolved_query, embedding_model, collection, prior_context=prior_context)
 
     context = format_context_from_pairs(docs_metas)
     header = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n"
@@ -1052,14 +1090,14 @@ def query_financial_chatbot(user_query, embedding_model, collection, chat_histor
     return response, docs_metas, extra_info
 
 
-def stream_financial_chatbot(user_query, embedding_model, collection, chat_history: list = []):
+def stream_financial_chatbot(user_query, embedding_model, collection, chat_history: list = [], prior_context: dict | None = None):
     """
     Streaming query.  Same resolution and history injection as query_financial_chatbot.
     Yields (token, docs_metas, extra_info) on each streamed chunk.
     """
     resolved_query = resolve_query_with_history(user_query, chat_history)
 
-    docs_metas, extra_info = retrive(resolved_query, embedding_model, collection)
+    docs_metas, extra_info = retrive(resolved_query, embedding_model, collection, prior_context=prior_context)
 
     context = format_context_from_pairs(docs_metas)
     header = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n"

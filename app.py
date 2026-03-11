@@ -27,6 +27,9 @@ st.markdown("Ask me about your business finances")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "last_retrieval" not in st.session_state:
+    st.session_state.last_retrieval = None
+
 if "collection" not in st.session_state:
     with st.spinner("Loading financial data..."):
         collection, embedding_model = ingest_data(reset_db=RESET_DB)
@@ -62,8 +65,10 @@ if user_input:
             user_input,
             embedding_model,
             collection,
-            chat_history=st.session_state.messages
+            chat_history=st.session_state.messages,
+            prior_context=st.session_state.last_retrieval,
         )
+    st.session_state.last_retrieval = extra_info
 
     # Extract citations from retrieved chunks
     citations = [
@@ -90,7 +95,8 @@ if user_input:
             user_input,
             embedding_model,
             collection,
-            chat_history=st.session_state.messages
+            chat_history=st.session_state.messages,
+            prior_context=st.session_state.last_retrieval,
         ):
             full_text += token
             placeholder.markdown(full_text)
@@ -99,6 +105,7 @@ if user_input:
 
         # show caption after stream finishes
         if final_extra:
+            st.session_state.last_retrieval = final_extra
             cap = f"Mode: {final_extra['mode']}, Periods: {final_extra.get('periods', [])}"
             if final_extra.get("time_window"):
                 tw = final_extra["time_window"]
