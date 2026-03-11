@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Retrieval code and generation of the augmented prompt fed to the LLM.
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -250,6 +252,114 @@ def extract_last_n(user_query: str) -> tuple[str, int] | None:
     return None
 
 
+def extract_year_reference(user_query: str) -> int | None:
+    m = re.search(r"\b(20\d{2})\b", user_query)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def extract_explicit_month_periods(user_query: str) -> list[str]:
+    """
+    Extract explicit month periods from queries like:
+    - "pnl for nov and dec in 2025" -> ["2025-11", "2025-12"]
+    - "revenue in January 2026" -> ["2026-01"]
+    - "jan to mar 2024" -> ["2024-01", "2024-02", "2024-03"]
+    Also supports explicit YYYY-MM strings.
+    """
+    q = user_query.lower()
+    periods: list[str] = []
+
+    # Explicit YYYY-MM occurrences
+    for y, m in re.findall(r"\b(20\d{2})-(0?[1-9]|1[0-2])\b", q):
+        periods.append(f"{int(y):04d}-{int(m):02d}")
+
+    # Month range: "jan to mar 2024"
+    range_match = re.search(
+        r"\b([a-z]{3,9})\s*(?:to|\-)\s*([a-z]{3,9})\s*(?:in\s*)?(20\d{2})\b",
+        q,
+    )
+    if range_match and range_match.group(1) in MONTHS and range_match.group(2) in MONTHS:
+        y = int(range_match.group(3))
+        start = f"{y:04d}-{MONTHS[range_match.group(1)]:02d}"
+        end = f"{y:04d}-{MONTHS[range_match.group(2)]:02d}"
+        if start <= end:
+            return [str(p) for p in pd.period_range(start=start, end=end, freq="M")]
+
+    year = extract_year_reference(q)
+    if year is not None:
+        # Multiple month mentions with a year: "nov and dec 2025"
+        month_tokens = [tok for tok in re.findall(r"\b([a-z]{3,9})\b", q) if tok in MONTHS]
+        for tok in month_tokens:
+            periods.append(f"{year:04d}-{MONTHS[tok]:02d}")
+
+    # Single month+year patterns (Jan 2026, Jan26, etc.)
+    single = extract_month_period(q)
+    if single:
+        periods.append(single)
+
+    return sorted(set(periods))
+
+
+def extract_relative_time_window(user_query: str, granularity: str, latest_date_iso: str) -> dict[str, str] | None:
+    """
+    Handles relative windows not covered by extract_time_window(), e.g.
+    this year / last year / year to date / this quarter / last quarter.
+    """
+    q = user_query.lower().strip()
+    latest_ts = pd.Timestamp(latest_date_iso)
+    latest_m = latest_ts.to_period("M")
+    latest_q = latest_ts.to_period("Q")
+
+    if re.search(r"\b(year to date|ytd)\b", q) or re.search(r"\bthis year\b", q):
+        if granularity == "monthly":
+            start = f"{latest_ts.year:04d}-01"
+            end = str(latest_m)
+        else:
+            start = f"{latest_ts.year:04d}Q1"
+            end = str(latest_q)
+        return {"start": start, "end": end}
+
+    if re.search(r"\blast year\b", q):
+        y = latest_ts.year - 1
+        if granularity == "monthly":
+            return {"start": f"{y:04d}-01", "end": f"{y:04d}-12"}
+        return {"start": f"{y:04d}Q1", "end": f"{y:04d}Q4"}
+
+    # "compare this quarter to last quarter" (or mention both) -> include both quarters
+    if ("this quarter" in q) and ("last quarter" in q):
+        prev_q = latest_q - 1
+        if granularity == "quarterly":
+            return {"start": str(prev_q), "end": str(latest_q)}
+        start = prev_q.asfreq("M", how="start")
+        end = latest_q.asfreq("M", how="end")
+        return {"start": str(start), "end": str(end)}
+
+    if re.search(r"\bthis quarter\b", q):
+        if granularity == "quarterly":
+            return {"start": str(latest_q), "end": str(latest_q)}
+        start = latest_q.asfreq("M", how="start")
+        end = latest_q.asfreq("M", how="end")
+        return {"start": str(start), "end": str(end)}
+
+    if re.search(r"\blast quarter\b", q):
+        prev_q = latest_q - 1
+        if granularity == "quarterly":
+            return {"start": str(prev_q), "end": str(prev_q)}
+        start = prev_q.asfreq("M", how="start")
+        end = prev_q.asfreq("M", how="end")
+        return {"start": str(start), "end": str(end)}
+
+    if re.search(r"\bthis month\b", q) and granularity == "monthly":
+        return {"start": str(latest_m), "end": str(latest_m)}
+
+    if re.search(r"\blast month\b", q) and granularity == "monthly":
+        prev_m = latest_m - 1
+        return {"start": str(prev_m), "end": str(prev_m)}
+
+    return None
+
+
 def extract_time_window(
     user_query: str, granularity: str, latest_date_iso: str
 ) -> dict[str, str] | None:
@@ -352,55 +462,230 @@ def get_chunks_by_periods(collection, chunk_type: str, periods: list[str]):
     return docs_metas
 
 
+RANKING_KEYWORDS = {
+    "best", "worst", "highest", "lowest", "top", "bottom", "strongest", "weakest",
+    "most", "least",
+}
+EXPLANATION_KEYWORDS = {
+    "why", "pattern", "patterns", "explain", "explanation", "drivers", "driver",
+    "going on", "before", "after",
+}
+COMPARISON_KEYWORDS = {
+    "growth", "change", "increase", "decline", "difference", "compare", "compared", "versus", "vs",
+}
+
+
+def classify_intent(user_query: str) -> str:
+    q = user_query.lower()
+    if any(k in q for k in EXPLANATION_KEYWORDS):
+        return "semantic_exploration"
+    if any(k in q for k in RANKING_KEYWORDS):
+        return "analytical_ranking"
+    return "exact_lookup"
+
+
+def metric_for_ranking(user_query: str) -> str:
+    q = user_query.lower()
+    if any(k in q for k in ["sales", "revenue", "income"]):
+        return "total_income"
+    if "margin" in q:
+        return "margin"
+    return "net_pl"
+
+
+def compute_income_growth(docs_metas: list[tuple[str, dict]]) -> dict | None:
+    if len(docs_metas) < 2:
+        return None
+    sorted_pairs = sorted(docs_metas, key=lambda dm: (dm[1].get("period") or ""))
+    first_meta = sorted_pairs[0][1]
+    last_meta = sorted_pairs[-1][1]
+    a = first_meta.get("total_income")
+    b = last_meta.get("total_income")
+    if a is None or b is None or a == 0:
+        return None
+    pct = ((b - a) / a) * 100
+    return {
+        "from_period": first_meta.get("period"),
+        "to_period": last_meta.get("period"),
+        "income_from": a,
+        "income_to": b,
+        "income_growth_pct": pct,
+    }
+
+
 def retrive(user_query, embedding_model, collection, top_k: int = 5):
     meta = load_index_meta()
     latest_date = meta['latest_date']
+    available_months = meta.get("available_months", [])
+    available_quarters = meta.get("available_quarters", [])
 
     time_period = infer_granularity(user_query=user_query)
+    intent = classify_intent(user_query)
 
-    # 1) Deterministic: last N months/quarters
+    # 1) Exact lookup path: explicit periods (including multi-month)
+    explicit_periods: list[str] = []
+    if time_period == "monthly":
+        explicit_periods = extract_explicit_month_periods(user_query)
+        if available_months:
+            avail = set(available_months)
+            explicit_periods = [p for p in explicit_periods if p in avail]
+    elif time_period == "quarterly":
+        qp = extract_quarter_period(user_query)
+        if qp:
+            explicit_periods = [qp]
+        if available_quarters:
+            avail = set(available_quarters)
+            explicit_periods = [p for p in explicit_periods if p in avail]
+
+    if explicit_periods:
+        docs_metas = get_chunks_by_periods(collection, chunk_type=time_period, periods=explicit_periods)
+        computed = None
+        if any(k in user_query.lower() for k in COMPARISON_KEYWORDS):
+            computed = compute_income_growth(docs_metas)
+        return docs_metas, {
+            "mode": "exact_lookup",
+            "intent": "exact_lookup",
+            "latest_date": latest_date,
+            "granularity": time_period,
+            "periods": explicit_periods,
+            "time_window": None,
+            "computed": computed,
+        }
+
+    # 2) Exact lookup path: relative windows like "last 4 months" (kept deterministic)
     req = extract_last_n(user_query=user_query)
     if req:
         g, n = req
         periods = last_n_months(latest_date, n) if g == 'monthly' else last_n_quarters(latest_date, n)
         docs_metas = get_chunks_by_periods(collection, chunk_type=g, periods=periods)
-        print(f'Deterministic Retrieval: last N {periods}')
+        computed = None
+        if any(k in user_query.lower() for k in COMPARISON_KEYWORDS):
+            computed = compute_income_growth(docs_metas)
+        # If this is a ranking query (e.g. "highest sales"), rank within the window deterministically.
+        if intent == "analytical_ranking":
+            metric = metric_for_ranking(user_query)
+            ranked: list[tuple[float, str, dict]] = []
+            for doc, m in docs_metas:
+                if metric == "margin":
+                    inc = m.get("total_income") or 0
+                    npv = m.get("net_pl") or 0
+                    val = (npv / inc) if inc else None
+                else:
+                    val = m.get(metric)
+                if val is None:
+                    continue
+                ranked.append((float(val), doc, m))
+            reverse = not any(w in user_query.lower() for w in ["worst", "lowest", "weakest"])
+            ranked.sort(key=lambda x: x[0], reverse=reverse)
+            top = [(d, m) for _, d, m in ranked[:top_k]]
+            return top, {
+                "mode": "analytical_ranking",
+                "intent": "analytical_ranking",
+                "latest_date": latest_date,
+                "granularity": g,
+                "periods": [m.get("period") for _, m in top],
+                "time_window": {"start": periods[0], "end": periods[-1]} if periods else None,
+                "ranking_metric": metric,
+                "computed": None,
+            }
+
         return docs_metas, {
             "mode": "exact_window",
+            "intent": "exact_lookup",
             "latest_date": latest_date,
+            "granularity": g,
             "periods": periods,
-            "time_window": None,
+            "time_window": {"start": periods[0], "end": periods[-1]} if periods else None,
+            "computed": computed,
         }
 
-    # 2) Deterministic: exact named period
+    # 3) Exact lookup path: exact single named period
     period = extract_single_period(user_query=user_query, granularity=time_period)
     if period:
         docs_metas = get_chunks_by_periods(collection, time_period, [period])
-        print(f'Deterministic Retrieval: exact period {period}')
         return docs_metas, {
-            "mode": "exact_period",
+            "mode": "exact_lookup",
+            "intent": "exact_lookup",
             "latest_date": latest_date,
+            "granularity": time_period,
             "periods": [period],
             "time_window": None,
+            "computed": None,
         }
 
-    # 3) Semantic similarity search (with optional time window filter)
-    time_window = extract_time_window(user_query, time_period, latest_date)
+    # 4) Time window extraction (used for ranking, semantic filtering, and exact compare windows)
+    time_window = extract_time_window(user_query, time_period, latest_date) or extract_relative_time_window(
+        user_query, time_period, latest_date
+    )
+
+    # 4a) Exact lookup path: relative compare windows (e.g. "compare this quarter to last quarter")
+    if intent == "exact_lookup" and time_window:
+        periods = periods_in_range(time_window["start"], time_window["end"], time_period)
+        if time_period == "monthly" and available_months:
+            avail = set(available_months)
+            periods = [p for p in periods if p in avail]
+        if time_period == "quarterly" and available_quarters:
+            avail = set(available_quarters)
+            periods = [p for p in periods if p in avail]
+
+        docs_metas = get_chunks_by_periods(collection, chunk_type=time_period, periods=periods)
+        computed = None
+        if any(k in user_query.lower() for k in COMPARISON_KEYWORDS):
+            computed = compute_income_growth(docs_metas)
+        return docs_metas, {
+            "mode": "exact_window",
+            "intent": "exact_lookup",
+            "latest_date": latest_date,
+            "granularity": time_period,
+            "periods": periods,
+            "time_window": time_window,
+            "computed": computed,
+        }
+
+    # 4b) Analytical/ranking path: time window + deterministic ranking (no semantic)
+    if intent == "analytical_ranking" and time_window:
+        candidate_periods = periods_in_range(time_window["start"], time_window["end"], time_period)
+        if time_period == "monthly" and available_months:
+            avail = set(available_months)
+            candidate_periods = [p for p in candidate_periods if p in avail]
+        if time_period == "quarterly" and available_quarters:
+            avail = set(available_quarters)
+            candidate_periods = [p for p in candidate_periods if p in avail]
+
+        docs_metas = get_chunks_by_periods(collection, chunk_type=time_period, periods=candidate_periods)
+        metric = metric_for_ranking(user_query)
+        ranked: list[tuple[float, str, dict]] = []
+        for doc, m in docs_metas:
+            if metric == "margin":
+                inc = m.get("total_income") or 0
+                npv = m.get("net_pl") or 0
+                val = (npv / inc) if inc else None
+            else:
+                val = m.get(metric)
+            if val is None:
+                continue
+            ranked.append((float(val), doc, m))
+        reverse = not any(w in user_query.lower() for w in ["worst", "lowest", "weakest"])
+        ranked.sort(key=lambda x: x[0], reverse=reverse)
+        top = [(d, m) for _, d, m in ranked[:top_k]]
+        return top, {
+            "mode": "analytical_ranking",
+            "intent": "analytical_ranking",
+            "latest_date": latest_date,
+            "granularity": time_period,
+            "periods": [m.get("period") for _, m in top],
+            "time_window": time_window,
+            "ranking_metric": metric,
+            "computed": None,
+        }
+
+    # 5) Semantic exploration path (optionally time-window filtered)
     where_clause = {"chunk_type": time_period}
     if time_window:
-        period_list = periods_in_range(
-            time_window["start"], time_window["end"], time_period
-        )
-        where_clause = {
-            "$and": [
-                {"chunk_type": time_period},
-                {"period": {"$in": period_list}},
-            ]
-        }
-        print(f"Semantic Similarity Retrieval (time_window: {time_window['start']} → {time_window['end']})")
-    else:
-        print("Semantic Similarity Retrieval")
+        period_list = periods_in_range(time_window["start"], time_window["end"], time_period)
+        where_clause = {"$and": [{"chunk_type": time_period}, {"period": {"$in": period_list}}]}
 
+    print("Semantic Similarity Retrieval")
     query_embedding = embedding_model.encode(user_query)
     results = collection.query(
         query_embeddings=[query_embedding.tolist()],
@@ -412,10 +697,13 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
     docs_metas = list(zip(docs, metas))
 
     extra_info = {
-        "mode": "semantic",
+        "mode": "semantic_exploration",
+        "intent": "semantic_exploration",
         "latest_date": latest_date,
+        "granularity": time_period,
         "periods": [],
         "time_window": time_window,
+        "computed": None,
     }
     return docs_metas, extra_info
 
@@ -440,7 +728,19 @@ def query_financial_chatbot(user_query, embedding_model, collection, chat_histor
     docs_metas, extra_info = retrive(resolved_query, embedding_model, collection)
 
     context = format_context_from_pairs(docs_metas)
-    context = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n\n" + context
+    header = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n"
+    header += (
+        f"Routing: mode={extra_info.get('mode')}, granularity={extra_info.get('granularity')}, "
+        f"periods={extra_info.get('periods', [])}, time_window={extra_info.get('time_window')}\n"
+    )
+    if extra_info.get("computed"):
+        c = extra_info["computed"]
+        header += (
+            f"Computed: income growth from {c.get('from_period')} to {c.get('to_period')} "
+            f"= {c.get('income_growth_pct'):.1f}% "
+            f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
+        )
+    context = header + "\n" + context
 
     history_block = format_history_for_prompt(chat_history)
 
@@ -458,7 +758,19 @@ def stream_financial_chatbot(user_query, embedding_model, collection, chat_histo
     docs_metas, extra_info = retrive(resolved_query, embedding_model, collection)
 
     context = format_context_from_pairs(docs_metas)
-    context = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n\n" + context
+    header = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n"
+    header += (
+        f"Routing: mode={extra_info.get('mode')}, granularity={extra_info.get('granularity')}, "
+        f"periods={extra_info.get('periods', [])}, time_window={extra_info.get('time_window')}\n"
+    )
+    if extra_info.get("computed"):
+        c = extra_info["computed"]
+        header += (
+            f"Computed: income growth from {c.get('from_period')} to {c.get('to_period')} "
+            f"= {c.get('income_growth_pct'):.1f}% "
+            f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
+        )
+    context = header + "\n" + context
 
     history_block = format_history_for_prompt(chat_history)
 
