@@ -268,25 +268,166 @@ def create_period_stats(
     net_pl = total_income - total_expenses
     transaction_count =  len(period_income) + len(period_expenses)
 
-    # Top 3 category spends
-    top_categories = (
+    # Full category spends (for insight generation) and top N
+    category_totals = (
         period_expenses[period_expenses['date'].dt.to_period(period_type) == period]
         .groupby('category')['amount']
         .sum()
         .abs()
-        .nlargest(top_n_categories)
     )
+    category_spend = category_totals.to_dict()
+    top_categories = category_totals.nlargest(top_n_categories)
     top_cats_text = ', '.join([f"{cat}: £{amt:,.2f}" for cat, amt in top_categories.items()])
-    
+
     return {
         'total_income': total_income,
-        'total_expenses' : total_expenses,
-        'net_pl' : net_pl,
+        'total_expenses': total_expenses,
+        'net_pl': net_pl,
         'transaction_count': transaction_count,
         'top_cats_text': top_cats_text,
-        'top_categories': top_categories
-    }   
-    
+        'top_categories': top_categories,
+        'category_spend': category_spend,
+    }
+
+
+def generate_period_insight(stats: dict, all_periods_stats: list, period_type: str) -> str:
+    """
+    Produce a single, semantically rich insight sentence about what makes this
+    period financially unique. Includes period identifier and concrete numbers
+    so each chunk embeds distinctly (better cosine differentiation).
+    """
+    if not all_periods_stats:
+        return "Routine period with no comparative data available."
+
+    income = stats.get("total_income") or 0
+    expenses = stats.get("total_expenses") or 0
+    net_pl = stats.get("net_pl", 0)
+    category_spend = stats.get("category_spend") or {}
+
+    period_raw = stats.get("period")
+    period_display = str(period_raw) if period_raw is not None else ""
+    period_label = "month" if period_type == "monthly" else "quarter" if period_type == "quarterly" else "week"
+    findings = []
+
+    # 6) LOSS-MAKING — include concrete data so each sentence is unique
+    if expenses > income and income > 0:
+        deficit = expenses - income
+        findings.append(
+            f"Loss-making {period_label}: income £{income:,.0f}, expenses £{expenses:,.0f} (deficit £{deficit:,.0f})"
+        )
+
+    # 4) BEST/WORST in dataset — include net_pl for uniqueness
+    all_net_pls = [s.get("net_pl") for s in all_periods_stats if s.get("net_pl") is not None]
+    if all_net_pls:
+        max_pl = max(all_net_pls)
+        min_pl = min(all_net_pls)
+        if net_pl == max_pl and all_net_pls.count(max_pl) == 1:
+            findings.append(f"Best performing period in the dataset (net P&L £{net_pl:,.0f})")
+        elif net_pl == min_pl and all_net_pls.count(min_pl) == 1:
+            findings.append(f"Worst performing period in the dataset (net P&L £{net_pl:,.0f})")
+
+    # 1) MARGIN vs dataset average
+    if income > 0:
+        margin = (net_pl / income) * 100
+        margins = [
+            (s.get("net_pl", 0) / s["total_income"]) * 100
+            for s in all_periods_stats
+            if s.get("total_income") and s["total_income"] > 0
+        ]
+        if margins:
+            avg_margin = np.mean(margins)
+            if avg_margin > 0:
+                if margin >= avg_margin * 1.20:
+                    findings.append(f"Strong margin {period_label}: {margin:.0f}% (income £{income:,.0f}, dataset avg margin {avg_margin:.0f}%)")
+                elif margin <= avg_margin * 0.80:
+                    findings.append(f"Margin compression {period_label}: {margin:.0f}% (income £{income:,.0f}, dataset avg {avg_margin:.0f}%)")
+
+    # 2) INCOME TREND vs previous 3 periods
+    try:
+        idx = next(i for i, s in enumerate(all_periods_stats) if s.get("period") == stats.get("period"))
+    except StopIteration:
+        idx = -1
+    if idx >= 3:
+        prev_3_income = np.mean([all_periods_stats[i]["total_income"] for i in range(idx - 3, idx) if all_periods_stats[i].get("total_income") is not None])
+        if prev_3_income and prev_3_income > 0:
+            pct = ((income - prev_3_income) / prev_3_income) * 100
+            if pct >= 15:
+                findings.append(f"Revenue surge: income £{income:,.0f}, {pct:.0f}% above prior 3-{period_label} average (£{prev_3_income:,.0f})")
+            elif pct <= -15:
+                findings.append(f"Revenue decline: income £{income:,.0f}, {abs(pct):.0f}% below prior 3-{period_label} average")
+    elif 0 < idx < 3 and idx > 0:
+        prev_income = np.mean([all_periods_stats[i]["total_income"] for i in range(idx) if all_periods_stats[i].get("total_income") is not None])
+        if prev_income and prev_income > 0:
+            pct = ((income - prev_income) / prev_income) * 100
+            if pct >= 15:
+                findings.append(f"Revenue surge: income £{income:,.0f}, {pct:.0f}% above prior periods average")
+            elif pct <= -15:
+                findings.append(f"Revenue decline: income £{income:,.0f}, {abs(pct):.0f}% below prior periods average")
+
+    # 3) EXPENSE ANOMALY: category >40% above its own average — include spend amount
+    for cat, spend in category_spend.items():
+        cat_values = [
+            (s.get("category_spend") or {}).get(cat, 0)
+            for s in all_periods_stats
+        ]
+        cat_values = [v for v in cat_values if v is not None and v > 0]
+        if not cat_values:
+            continue
+        avg_cat = np.mean(cat_values)
+        if avg_cat > 0 and spend >= avg_cat * 1.40:
+            pct_above = ((spend - avg_cat) / avg_cat) * 100
+            findings.append(f"{cat} £{spend:,.0f}, {pct_above:.0f}% above category average (£{avg_cat:,.0f})")
+
+    # 5) CATEGORY DOMINANCE — include share and spend
+    if expenses > 0 and category_spend:
+        for cat, spend in category_spend.items():
+            share_pct = (spend / expenses) * 100
+            if share_pct >= 40:
+                findings.append(f"{cat} consumed {share_pct:.0f}% of total spend (£{spend:,.0f} of £{expenses:,.0f})")
+                break
+
+    # Pick 1–2 most striking; when loss-making is common, don't always lead with it
+    if not findings:
+        return f"{period_display}: Routine {period_label}, margins and spend in line with historical norms."
+
+    loss_making_share = sum(
+        1 for s in all_periods_stats
+        if (s.get("total_expenses") or 0) > (s.get("total_income") or 0)
+    ) / max(len(all_periods_stats), 1)
+    lead_with_loss = loss_making_share < 0.5  # lead with loss-making only if it's not the norm
+
+    ordered = []
+    if lead_with_loss:
+        for f in findings:
+            if "Loss-making" in f:
+                ordered.append(f)
+                break
+    for f in findings:
+        if ("Best performing" in f or "Worst performing" in f) and f not in ordered:
+            ordered.append(f)
+    for f in findings:
+        if ("margin" in f.lower() or "Revenue" in f) and f not in ordered:
+            ordered.append(f)
+    for f in findings:
+        if ("above average" in f or "consumed" in f) and f not in ordered:
+            ordered.append(f)
+    if not lead_with_loss:
+        for f in findings:
+            if "Loss-making" in f and f not in ordered:
+                ordered.append(f)
+                break
+    for f in findings:
+        if f not in ordered:
+            ordered.append(f)
+    chosen = ordered[:2]
+
+    # Prefix with period so every chunk has a unique, data-rich opening
+    sentence = " ".join(chosen) + "."
+    if period_display:
+        return f"{period_display}: {sentence}"
+    return sentence
+
+
 #Create all the chunks: weekly, monthly, quarterly.
 def create_chunks(df: pd.DataFrame) -> list[dict]:
     """
@@ -324,21 +465,22 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
 
 
     # WEEKLY CHUNKS
-  
     df['week'] = df['date'].dt.to_period('W')
     weekly_groups = df.groupby('week')
-    
+    sorted_weeks = sorted(weekly_groups.groups.keys())
+    all_weekly_stats = []
+    for week in sorted_weeks:
+        s = create_period_stats(income_df, expense_df, week, 'W', 3)
+        s['period'] = week
+        all_weekly_stats.append(s)
+
     prev_week_pl = None
-    
-    for week, group in weekly_groups:
-        
-        weekly_stats = create_period_stats(income_df,expense_df,week,'W',3)
-        
-        # Week over week delta
+    for i, week in enumerate(sorted_weeks):
+        weekly_stats = all_weekly_stats[i]
         wow_delta = weekly_stats['net_pl'] - prev_week_pl if prev_week_pl is not None else 0
         wow_text = f"+£{wow_delta:,.2f}" if wow_delta >= 0 else f"-£{abs(wow_delta):,.2f}"
-        
-        chunk_text = f"""
+
+        body = f"""
         Weekly Financial Summary
         Period: {week}
         Total Income: £{weekly_stats['total_income']:,.2f}
@@ -348,6 +490,9 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
         Top Spending Categories: {weekly_stats['top_cats_text']}
         Transaction Count: {weekly_stats['transaction_count']}
         """
+        insight = generate_period_insight(weekly_stats, all_weekly_stats, 'weekly')
+        chunk_text = f"[INSIGHT]: {insight}\n\n---\n\n{body.strip()}"
+
         chunks.append({
             'text': chunk_text,
             'metadata': {
@@ -359,40 +504,34 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
                 'transaction_count': weekly_stats['transaction_count']
             }
         })
-        
         prev_week_pl = weekly_stats['net_pl']
 
     print(f"✓ Created {len([c for c in chunks if c['metadata']['chunk_type'] == 'weekly'])} weekly chunks")
 
     
     # MONTHLY CHUNKS
-    
-    
     df['month'] = df['date'].dt.to_period('M')
     monthly_groups = df.groupby('month')
-    
-    monthly_pls = {}  # Store for quarterly use and trend
-    
-    for month, group in monthly_groups:
+    sorted_months = sorted(monthly_groups.groups.keys())
+    all_monthly_stats = []
+    for month in sorted_months:
+        s = create_period_stats(income_df, expense_df, month, 'M', 5)
+        s['period'] = month
+        all_monthly_stats.append(s)
+    monthly_pls = {st['period']: st['net_pl'] for st in all_monthly_stats}
 
-        monthly_stats = create_period_stats(income_df,expense_df,month,'M',5)
-        
-        # Employee salary total
+    for i, month in enumerate(sorted_months):
+        monthly_stats = all_monthly_stats[i]
         employee_spend = abs(
             expense_df[
                 (expense_df['date'].dt.to_period('M') == month) &
                 (expense_df['category'] == 'Employee Salaries')
             ]['amount'].sum()
         )
-        
-        monthly_pls[month] = monthly_stats['net_pl']
-        
-        # 3 month cashflow trend
-        sorted_months = sorted(monthly_pls.keys())
-        recent_months = sorted_months[-3:]
+        recent_months = sorted_months[max(0, i - 2) : i + 1]
         trend_text = ' → '.join([f"£{monthly_pls[m]:,.2f}" for m in recent_months])
-        
-        chunk_text = f"""
+
+        body = f"""
         Monthly Financial Summary
         Period: {month}
         Total Income: £{monthly_stats['total_income']:,.2f}
@@ -403,6 +542,9 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
         3-Month Cashflow Trend: {trend_text}
         Transaction Count: {monthly_stats['transaction_count']}
         """
+        insight = generate_period_insight(monthly_stats, all_monthly_stats, 'monthly')
+        chunk_text = f"[INSIGHT]: {insight}\n\n---\n\n{body.strip()}"
+
         chunks.append({
             'text': chunk_text,
             'metadata': {
@@ -420,28 +562,29 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
 
     
     # QUARTERLY CHUNKS
-    
     df['quarter'] = df['date'].dt.to_period('Q')
     quarterly_groups = df.groupby('quarter')
-    
-    prev_quarter_pl = None
-    
-    for quarter, group in quarterly_groups:
+    sorted_quarters = sorted(quarterly_groups.groups.keys())
+    all_quarterly_stats = []
+    for quarter in sorted_quarters:
+        s = create_period_stats(income_df, expense_df, quarter, 'Q', 5)
+        s['period'] = quarter
+        all_quarterly_stats.append(s)
 
-        quarter_stats = create_period_stats(income_df, expense_df, quarter, 'Q', 5)
-        # Best performing month in quarter
+    prev_quarter_pl = None
+    for i, quarter in enumerate(sorted_quarters):
+        quarter_stats = all_quarterly_stats[i]
         quarter_months = [m for m in monthly_pls.keys() if m.year == quarter.year and ((m.month - 1) // 3 + 1) == quarter.quarter]
         if quarter_months:
             best_month = max(quarter_months, key=lambda m: monthly_pls[m])
             best_month_text = f"{best_month} (£{monthly_pls[best_month]:,.2f})"
         else:
             best_month_text = "N/A"
-        
-        # Quarter over quarter delta
+
         qoq_delta = quarter_stats['net_pl'] - prev_quarter_pl if prev_quarter_pl is not None else 0
         qoq_text = f"+£{qoq_delta:,.2f}" if qoq_delta >= 0 else f"-£{abs(qoq_delta):,.2f}"
-        
-        chunk_text = f"""
+
+        body = f"""
         Quarterly Financial Summary
         Period: {quarter}
         Total Income: £{quarter_stats['total_income']:,.2f}
@@ -452,6 +595,9 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
         Top Spending Categories: {quarter_stats['top_cats_text']}
         Transaction Count: {quarter_stats['transaction_count']}
         """
+        insight = generate_period_insight(quarter_stats, all_quarterly_stats, 'quarterly')
+        chunk_text = f"[INSIGHT]: {insight}\n\n---\n\n{body.strip()}"
+
         chunks.append({
             'text': chunk_text,
             'metadata': {
@@ -464,7 +610,6 @@ def create_chunks(df: pd.DataFrame) -> list[dict]:
                 'transaction_count': quarter_stats['transaction_count']
             }
         })
-        
         prev_quarter_pl = quarter_stats['net_pl']
 
     print(f"✓ Created {len([c for c in chunks if c['metadata']['chunk_type'] == 'quarterly'])} quarterly chunks")

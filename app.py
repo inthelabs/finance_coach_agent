@@ -99,7 +99,11 @@ if user_input:
 
         # show caption after stream finishes
         if final_extra:
-            st.caption(f"Mode: {final_extra['mode']}, Periods: {final_extra.get('periods', [])}")
+            cap = f"Mode: {final_extra['mode']}, Periods: {final_extra.get('periods', [])}"
+            if final_extra.get("time_window"):
+                tw = final_extra["time_window"]
+                cap += f", Time window: {tw['start']} → {tw['end']}"
+            st.caption(cap)
 
         # citations after stream finishes
         citations = [

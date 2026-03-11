@@ -250,6 +250,62 @@ def extract_last_n(user_query: str) -> tuple[str, int] | None:
     return None
 
 
+def extract_time_window(
+    user_query: str, granularity: str, latest_date_iso: str
+) -> dict[str, str] | None:
+    """
+    Extract a time window (start, end) from the query for use as a ChromaDB
+    metadata filter. Used when retrieval is semantic so that e.g. "best
+    performing months in last 2 years" still restricts to that window.
+
+    Returns None if no window can be inferred. Period format matches granularity:
+    YYYY-MM for monthly, YYYYQ# for quarterly.
+    """
+    q = user_query.lower().strip()
+
+    # "last N years" / "past N years"
+    m = re.search(r"\b(?:last|past)\s+(\d+)\s+years?\b", q)
+    if m:
+        n_years = int(m.group(1))
+        if granularity == "monthly":
+            periods = last_n_months(latest_date_iso, n_years * 12)
+        else:
+            periods = last_n_quarters(latest_date_iso, n_years * 4)
+        if not periods:
+            return None
+        return {"start": periods[0], "end": periods[-1]}
+
+    # "last year" / "past year" (no number)
+    if re.search(r"\b(?:last|past)\s+year\b", q):
+        if granularity == "monthly":
+            periods = last_n_months(latest_date_iso, 12)
+        else:
+            periods = last_n_quarters(latest_date_iso, 4)
+        if not periods:
+            return None
+        return {"start": periods[0], "end": periods[-1]}
+
+    # "in 2024" / "during 2024"
+    m = re.search(r"\b(?:in|during)\s+(20\d{2})\b", q)
+    if m:
+        year = int(m.group(1))
+        if granularity == "monthly":
+            return {"start": f"{year}-01", "end": f"{year}-12"}
+        return {"start": f"{year}Q1", "end": f"{year}Q4"}
+
+    # "from 2023 to 2024" / "between 2023 and 2024"
+    m = re.search(r"\b(?:from|between)\s+(20\d{2})\s+(?:to|and)\s+(20\d{2})\b", q)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if y1 > y2:
+            y1, y2 = y2, y1
+        if granularity == "monthly":
+            return {"start": f"{y1}-01", "end": f"{y2}-12"}
+        return {"start": f"{y1}Q1", "end": f"{y2}Q4"}
+
+    return None
+
+
 def extract_period(user_query: str):
     m = re.search(r"\b(20\d{2}-\d{2})\b", user_query)
     if m:
@@ -270,6 +326,16 @@ def last_n_months(latest_date_iso: str, n: int) -> list[str]:
 def last_n_quarters(latest_date_iso: str, n: int) -> list[str]:
     latest = pd.Timestamp(latest_date_iso).to_period("Q")
     return [str(latest - i) for i in reversed(range(n))]
+
+
+def periods_in_range(start: str, end: str, granularity: str) -> list[str]:
+    """Expand start/end period strings into a list of period strings. ChromaDB
+    only supports $gte/$lte on numbers, so we filter by $in with this list."""
+    if granularity == "monthly":
+        r = pd.period_range(start=start, end=end, freq="M")
+    else:
+        r = pd.period_range(start=start, end=end, freq="Q")
+    return [str(p) for p in r]
 
 
 def get_chunks_by_periods(collection, chunk_type: str, periods: list[str]):
@@ -299,27 +365,59 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
         periods = last_n_months(latest_date, n) if g == 'monthly' else last_n_quarters(latest_date, n)
         docs_metas = get_chunks_by_periods(collection, chunk_type=g, periods=periods)
         print(f'Deterministic Retrieval: last N {periods}')
-        return docs_metas, {"mode": "exact_window", "latest_date": latest_date, "periods": periods}
+        return docs_metas, {
+            "mode": "exact_window",
+            "latest_date": latest_date,
+            "periods": periods,
+            "time_window": None,
+        }
 
     # 2) Deterministic: exact named period
     period = extract_single_period(user_query=user_query, granularity=time_period)
     if period:
         docs_metas = get_chunks_by_periods(collection, time_period, [period])
         print(f'Deterministic Retrieval: exact period {period}')
-        return docs_metas, {"mode": "exact_period", "latest_date": latest_date, "periods": [period]}
+        return docs_metas, {
+            "mode": "exact_period",
+            "latest_date": latest_date,
+            "periods": [period],
+            "time_window": None,
+        }
 
-    # 3) Semantic similarity search
+    # 3) Semantic similarity search (with optional time window filter)
+    time_window = extract_time_window(user_query, time_period, latest_date)
+    where_clause = {"chunk_type": time_period}
+    if time_window:
+        period_list = periods_in_range(
+            time_window["start"], time_window["end"], time_period
+        )
+        where_clause = {
+            "$and": [
+                {"chunk_type": time_period},
+                {"period": {"$in": period_list}},
+            ]
+        }
+        print(f"Semantic Similarity Retrieval (time_window: {time_window['start']} → {time_window['end']})")
+    else:
+        print("Semantic Similarity Retrieval")
+
     query_embedding = embedding_model.encode(user_query)
     results = collection.query(
         query_embeddings=[query_embedding.tolist()],
         n_results=top_k,
-        where={"chunk_type": time_period}
+        where=where_clause,
     )
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
     docs_metas = list(zip(docs, metas))
-    print('Semantic Similarity Retrieval')
-    return docs_metas, {"mode": "semantic", "latest_date": latest_date}
+
+    extra_info = {
+        "mode": "semantic",
+        "latest_date": latest_date,
+        "periods": [],
+        "time_window": time_window,
+    }
+    return docs_metas, extra_info
 
 
 def format_context_from_pairs(docs_metas) -> str:
