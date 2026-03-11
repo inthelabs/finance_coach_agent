@@ -35,6 +35,26 @@ MONTHS = {
 # Words that suggest a message is a pronoun-laden fragment referencing prior context.
 FRAGMENT_PRONOUNS = {'it', 'that', 'he', 'she', 'they', 'this', 'those', 'them'}
 
+# Phrases that explicitly refer back to prior context even if the message is long.
+REFERENTIAL_PHRASES = {
+    "this period",
+    "that period",
+    "during this period",
+    "during that period",
+    "in this period",
+    "in that period",
+    "this month",
+    "that month",
+    "this quarter",
+    "that quarter",
+    "this year",
+    "that year",
+    "these months",
+    "those months",
+    "these quarters",
+    "those quarters",
+}
+
 # Single-word messages that carry no standalone financial meaning.
 STANDALONE_AFFIRMATIONS = {'yes', 'no', 'yeah', 'ok', 'okay', 'sure', 'nope', 'yep'}
 
@@ -61,14 +81,15 @@ def is_fragment_or_ambiguous(user_message: str) -> bool:
     5. Otherwise → False
     """
     words = user_message.strip().lower().split()
+    msg = " ".join(words)
 
     # Rule 1: bare affirmation with no content
     if len(words) == 1 and words[0] in STANDALONE_AFFIRMATIONS:
         return True
 
-    # Rule 2: long enough to be self-contained
-    if len(words) > 6:
-        return False
+    # Rule 2: explicit referential phrasing (even if long)
+    if any(p in msg for p in REFERENTIAL_PHRASES):
+        return True
 
     # Rule 3: contains a financial domain keyword — treat as standalone
     if FINANCIAL_KEYWORDS.intersection(set(words)):
@@ -474,6 +495,10 @@ COMPARISON_KEYWORDS = {
     "growth", "change", "increase", "decline", "difference", "compare", "compared", "versus", "vs",
 }
 
+BREAKDOWN_KEYWORDS = {
+    "by month", "monthly breakdown", "month by month", "by quarter", "quarterly breakdown",
+}
+
 
 def classify_intent(user_query: str) -> str:
     q = user_query.lower()
@@ -513,6 +538,91 @@ def compute_income_growth(docs_metas: list[tuple[str, dict]]) -> dict | None:
     }
 
 
+def _safe_pct_change(a: float, b: float) -> float | None:
+    if a is None or a == 0:
+        return None
+    return ((b - a) / a) * 100
+
+
+def detect_answer_granularity_for_comparison(user_query: str) -> tuple[str, bool]:
+    """
+    Returns (answer_granularity, expand_to_subperiods).
+    - If the user asks for a breakdown ("by month"), expand_to_subperiods=True.
+    - If comparing years only, answer_granularity='yearly'.
+    - If comparing quarters, answer_granularity='quarterly'.
+    - Otherwise default to 'monthly'.
+    """
+    q = user_query.lower()
+    expand = any(k in q for k in BREAKDOWN_KEYWORDS)
+    if "by month" in q or "month by month" in q or "monthly breakdown" in q:
+        return ("monthly", True)
+    if "by quarter" in q or "quarterly breakdown" in q:
+        return ("quarterly", True)
+    if re.search(r"\bbetween\s+20\d{2}\s+and\s+20\d{2}\b", q) or re.search(r"\bbetween\s+20\d{2}\s+to\s+20\d{2}\b", q):
+        return ("yearly", expand)
+    if re.search(r"\bbetween\s+q[1-4]\s+and\s+q[1-4]\s+20\d{2}\b", q) or re.search(r"\bbetween\s+(20\d{2})\s*q[1-4]\s+and\s+(20\d{2})\s*q[1-4]\b", q):
+        return ("quarterly", expand)
+    if re.search(r"\bbetween\s+([a-z]{3,9})\s+and\s+([a-z]{3,9})\s+20\d{2}\b", q):
+        return ("monthly", expand)
+    return ("monthly", expand)
+
+
+def extract_between_years(user_query: str) -> tuple[int, int] | None:
+    q = user_query.lower()
+    m = re.search(r"\bbetween\s+(20\d{2})\s+(?:and|to)\s+(20\d{2})\b", q)
+    if not m:
+        return None
+    y1, y2 = int(m.group(1)), int(m.group(2))
+    if y1 > y2:
+        y1, y2 = y2, y1
+    return (y1, y2)
+
+
+def extract_between_quarters_same_year(user_query: str) -> tuple[str, str] | None:
+    """
+    "between Q1 and Q2 2025" -> ("2025Q1","2025Q2")
+    """
+    q = user_query.lower()
+    m = re.search(r"\bbetween\s+q([1-4])\s+and\s+q([1-4])\s+(20\d{2})\b", q)
+    if not m:
+        return None
+    q1, q2, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return (f"{y}Q{q1}", f"{y}Q{q2}")
+
+
+def quarter_to_months(q: str) -> list[str]:
+    """Convert YYYYQ# to list of YYYY-MM months in that quarter."""
+    p = pd.Period(q, freq="Q")
+    start = p.asfreq("M", how="start")
+    end = p.asfreq("M", how="end")
+    return [str(x) for x in pd.period_range(start=start, end=end, freq="M")]
+
+
+def aggregate_metric_over_periods(docs_metas: list[tuple[str, dict]], metric: str) -> float:
+    total = 0.0
+    for _, m in docs_metas:
+        v = m.get(metric)
+        if v is None:
+            continue
+        total += float(v)
+    return total
+
+
+def summarize_for_context(docs_metas: list[tuple[str, dict]], max_items: int = 6) -> list[tuple[str, dict]]:
+    """
+    Avoid dumping dozens of chunks into the prompt. Keep a small number of
+    sources for evidence / citations.
+    """
+    if len(docs_metas) <= max_items:
+        return docs_metas
+    # Prefer earliest + latest + a few around the middle
+    sorted_pairs = sorted(docs_metas, key=lambda dm: (dm[1].get("period") or ""))
+    head = sorted_pairs[:2]
+    tail = sorted_pairs[-2:]
+    middle = sorted_pairs[len(sorted_pairs)//2 : len(sorted_pairs)//2 + max(0, max_items - 4)]
+    return head + middle + tail
+
+
 def retrive(user_query, embedding_model, collection, top_k: int = 5):
     meta = load_index_meta()
     latest_date = meta['latest_date']
@@ -521,6 +631,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
 
     time_period = infer_granularity(user_query=user_query)
     intent = classify_intent(user_query)
+    is_comparison = any(k in user_query.lower() for k in COMPARISON_KEYWORDS)
+    answer_granularity, expand_to_subperiods = detect_answer_granularity_for_comparison(user_query) if is_comparison else (time_period, False)
 
     # 1) Exact lookup path: explicit periods (including multi-month)
     explicit_periods: list[str] = []
@@ -530,9 +642,14 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
             avail = set(available_months)
             explicit_periods = [p for p in explicit_periods if p in avail]
     elif time_period == "quarterly":
-        qp = extract_quarter_period(user_query)
-        if qp:
-            explicit_periods = [qp]
+        # If the query is a comparison between two quarters, prefer extracting both.
+        qs = extract_between_quarters_same_year(user_query) if is_comparison else None
+        if qs:
+            explicit_periods = [qs[0], qs[1]]
+        else:
+            qp = extract_quarter_period(user_query)
+            if qp:
+                explicit_periods = [qp]
         if available_quarters:
             avail = set(available_quarters)
             explicit_periods = [p for p in explicit_periods if p in avail]
@@ -550,6 +667,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
             "periods": explicit_periods,
             "time_window": None,
             "computed": computed,
+            "answer_granularity": answer_granularity,
+            "expand_to_subperiods": expand_to_subperiods,
         }
 
     # 2) Exact lookup path: relative windows like "last 4 months" (kept deterministic)
@@ -587,6 +706,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
                 "time_window": {"start": periods[0], "end": periods[-1]} if periods else None,
                 "ranking_metric": metric,
                 "computed": None,
+                "answer_granularity": answer_granularity,
+                "expand_to_subperiods": expand_to_subperiods,
             }
 
         return docs_metas, {
@@ -597,6 +718,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
             "periods": periods,
             "time_window": {"start": periods[0], "end": periods[-1]} if periods else None,
             "computed": computed,
+            "answer_granularity": answer_granularity,
+            "expand_to_subperiods": expand_to_subperiods,
         }
 
     # 3) Exact lookup path: exact single named period
@@ -611,12 +734,176 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
             "periods": [period],
             "time_window": None,
             "computed": None,
+            "answer_granularity": answer_granularity,
+            "expand_to_subperiods": expand_to_subperiods,
         }
 
     # 4) Time window extraction (used for ranking, semantic filtering, and exact compare windows)
     time_window = extract_time_window(user_query, time_period, latest_date) or extract_relative_time_window(
         user_query, time_period, latest_date
     )
+
+    # 4aa) Comparison queries with broad windows: do NOT expand unless breakdown requested.
+    # Example: "growth between 2024 and 2025" -> yearly comparison (aggregate), not 24 monthly chunks.
+    if is_comparison and answer_granularity == "yearly":
+        years = extract_between_years(user_query)
+        if years:
+            y1, y2 = years
+            # Use monthly chunks as the aggregation substrate (we only store weekly/monthly/quarterly)
+            months_y1 = [p for p in pd.period_range(start=f"{y1}-01", end=f"{y1}-12", freq="M").astype(str).tolist()]
+            months_y2 = [p for p in pd.period_range(start=f"{y2}-01", end=f"{y2}-12", freq="M").astype(str).tolist()]
+            if available_months:
+                avail = set(available_months)
+                months_y1 = [p for p in months_y1 if p in avail]
+                months_y2 = [p for p in months_y2 if p in avail]
+            docs1 = get_chunks_by_periods(collection, chunk_type="monthly", periods=months_y1)
+            docs2 = get_chunks_by_periods(collection, chunk_type="monthly", periods=months_y2)
+            inc1 = aggregate_metric_over_periods(docs1, "total_income")
+            inc2 = aggregate_metric_over_periods(docs2, "total_income")
+            growth = _safe_pct_change(inc1, inc2)
+            computed = {
+                "comparison": "yearly_income_growth",
+                "from_year": y1,
+                "to_year": y2,
+                "income_from": inc1,
+                "income_to": inc2,
+                "income_growth_pct": growth,
+            }
+            # Only include subperiod sources in context if the user explicitly asked for breakdown.
+            sources = (docs1 + docs2) if expand_to_subperiods else summarize_for_context(docs1 + docs2, max_items=6)
+            return sources, {
+                "mode": "exact_lookup",
+                "intent": "exact_lookup",
+                "latest_date": latest_date,
+                "granularity": "monthly",
+                "periods": [],
+                "time_window": {"start": f"{y1}-01", "end": f"{y2}-12"},
+                "computed": computed,
+                "answer_granularity": "yearly",
+                "expand_to_subperiods": expand_to_subperiods,
+            }
+
+    if is_comparison and answer_granularity == "monthly":
+        years = extract_between_years(user_query)
+        if years:
+            y1, y2 = years
+            # monthly breakdown: compare same month across years (YoY by month)
+            breakdown = []
+            for m in range(1, 13):
+                p1 = f"{y1:04d}-{m:02d}"
+                p2 = f"{y2:04d}-{m:02d}"
+                if available_months:
+                    avail = set(available_months)
+                    if p1 not in avail or p2 not in avail:
+                        continue
+                d1 = get_chunks_by_periods(collection, chunk_type="monthly", periods=[p1])
+                d2 = get_chunks_by_periods(collection, chunk_type="monthly", periods=[p2])
+                if not d1 or not d2:
+                    continue
+                inc1 = d1[0][1].get("total_income")
+                inc2 = d2[0][1].get("total_income")
+                if inc1 is None or inc2 is None:
+                    continue
+                breakdown.append(
+                    {
+                        "month": f"{m:02d}",
+                        "from_period": p1,
+                        "to_period": p2,
+                        "income_from": float(inc1),
+                        "income_to": float(inc2),
+                        "income_growth_pct": _safe_pct_change(float(inc1), float(inc2)),
+                    }
+                )
+            computed = {
+                "comparison": "monthly_yoy_income_growth",
+                "from_year": y1,
+                "to_year": y2,
+                "breakdown": breakdown,
+            }
+            # For breakdown requests, include all month pairs in context; otherwise keep it tight
+            sources = []
+            if expand_to_subperiods:
+                # include all referenced months as evidence
+                periods = [b["from_period"] for b in breakdown] + [b["to_period"] for b in breakdown]
+                sources = get_chunks_by_periods(collection, chunk_type="monthly", periods=periods)
+            else:
+                periods = []
+                for b in breakdown[:2] + breakdown[-2:]:
+                    periods.extend([b["from_period"], b["to_period"]])
+                sources = get_chunks_by_periods(collection, chunk_type="monthly", periods=periods)
+            return sources, {
+                "mode": "exact_lookup",
+                "intent": "exact_lookup",
+                "latest_date": latest_date,
+                "granularity": "monthly",
+                "periods": [],
+                "time_window": {"start": f"{y1}-01", "end": f"{y2}-12"},
+                "computed": computed,
+                "answer_granularity": "monthly",
+                "expand_to_subperiods": expand_to_subperiods,
+            }
+
+    if is_comparison and answer_granularity == "quarterly":
+        qs = extract_between_quarters_same_year(user_query)
+        if qs:
+            q1, q2 = qs
+            docs = get_chunks_by_periods(collection, chunk_type="quarterly", periods=[q1, q2])
+            # Fall back to aggregating monthly chunks if quarterly chunks are missing
+            if len(docs) < 2:
+                months1 = quarter_to_months(q1)
+                months2 = quarter_to_months(q2)
+                if available_months:
+                    avail = set(available_months)
+                    months1 = [p for p in months1 if p in avail]
+                    months2 = [p for p in months2 if p in avail]
+                d1 = get_chunks_by_periods(collection, chunk_type="monthly", periods=months1)
+                d2 = get_chunks_by_periods(collection, chunk_type="monthly", periods=months2)
+                inc1 = aggregate_metric_over_periods(d1, "total_income")
+                inc2 = aggregate_metric_over_periods(d2, "total_income")
+                computed = {
+                    "comparison": "quarterly_income_growth",
+                    "from_quarter": q1,
+                    "to_quarter": q2,
+                    "income_from": inc1,
+                    "income_to": inc2,
+                    "income_growth_pct": _safe_pct_change(inc1, inc2),
+                }
+                sources = summarize_for_context(d1 + d2, max_items=6)
+                return sources, {
+                    "mode": "exact_lookup",
+                    "intent": "exact_lookup",
+                    "latest_date": latest_date,
+                    "granularity": "monthly",
+                    "periods": [],
+                    "time_window": {"start": months1[0], "end": months2[-1]} if months1 and months2 else None,
+                    "computed": computed,
+                    "answer_granularity": "quarterly",
+                    "expand_to_subperiods": expand_to_subperiods,
+                }
+
+            inc1 = docs[0][1].get("total_income") if len(docs) > 0 else None
+            inc2 = docs[1][1].get("total_income") if len(docs) > 1 else None
+            computed = None
+            if inc1 is not None and inc2 is not None:
+                computed = {
+                    "comparison": "quarterly_income_growth",
+                    "from_quarter": q1,
+                    "to_quarter": q2,
+                    "income_from": inc1,
+                    "income_to": inc2,
+                    "income_growth_pct": _safe_pct_change(float(inc1), float(inc2)),
+                }
+            return docs, {
+                "mode": "exact_lookup",
+                "intent": "exact_lookup",
+                "latest_date": latest_date,
+                "granularity": "quarterly",
+                "periods": [q1, q2],
+                "time_window": None,
+                "computed": computed,
+                "answer_granularity": "quarterly",
+                "expand_to_subperiods": expand_to_subperiods,
+            }
 
     # 4a) Exact lookup path: relative compare windows (e.g. "compare this quarter to last quarter")
     if intent == "exact_lookup" and time_window:
@@ -640,6 +927,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
             "periods": periods,
             "time_window": time_window,
             "computed": computed,
+            "answer_granularity": answer_granularity,
+            "expand_to_subperiods": expand_to_subperiods,
         }
 
     # 4b) Analytical/ranking path: time window + deterministic ranking (no semantic)
@@ -677,6 +966,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
             "time_window": time_window,
             "ranking_metric": metric,
             "computed": None,
+            "answer_granularity": answer_granularity,
+            "expand_to_subperiods": expand_to_subperiods,
         }
 
     # 5) Semantic exploration path (optionally time-window filtered)
@@ -704,6 +995,8 @@ def retrive(user_query, embedding_model, collection, top_k: int = 5):
         "periods": [],
         "time_window": time_window,
         "computed": None,
+        "answer_granularity": time_period,
+        "expand_to_subperiods": False,
     }
     return docs_metas, extra_info
 
@@ -731,15 +1024,26 @@ def query_financial_chatbot(user_query, embedding_model, collection, chat_histor
     header = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n"
     header += (
         f"Routing: mode={extra_info.get('mode')}, granularity={extra_info.get('granularity')}, "
+        f"answer_granularity={extra_info.get('answer_granularity')}, expand_to_subperiods={extra_info.get('expand_to_subperiods')}, "
         f"periods={extra_info.get('periods', [])}, time_window={extra_info.get('time_window')}\n"
     )
     if extra_info.get("computed"):
         c = extra_info["computed"]
-        header += (
-            f"Computed: income growth from {c.get('from_period')} to {c.get('to_period')} "
-            f"= {c.get('income_growth_pct'):.1f}% "
-            f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
-        )
+        if c.get("comparison") in ("yearly_income_growth", "quarterly_income_growth"):
+            from_label = c.get("from_year") or c.get("from_quarter")
+            to_label = c.get("to_year") or c.get("to_quarter")
+            pct = c.get("income_growth_pct")
+            pct_txt = f"{pct:.1f}%" if pct is not None else "N/A"
+            header += (
+                f"Computed: income growth {from_label} → {to_label} = {pct_txt} "
+                f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
+            )
+        else:
+            header += (
+                f"Computed: income growth from {c.get('from_period')} to {c.get('to_period')} "
+                f"= {c.get('income_growth_pct'):.1f}% "
+                f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
+            )
     context = header + "\n" + context
 
     history_block = format_history_for_prompt(chat_history)
@@ -761,15 +1065,26 @@ def stream_financial_chatbot(user_query, embedding_model, collection, chat_histo
     header = f"Data time reference: latest transaction date = {extra_info['latest_date']}\n"
     header += (
         f"Routing: mode={extra_info.get('mode')}, granularity={extra_info.get('granularity')}, "
+        f"answer_granularity={extra_info.get('answer_granularity')}, expand_to_subperiods={extra_info.get('expand_to_subperiods')}, "
         f"periods={extra_info.get('periods', [])}, time_window={extra_info.get('time_window')}\n"
     )
     if extra_info.get("computed"):
         c = extra_info["computed"]
-        header += (
-            f"Computed: income growth from {c.get('from_period')} to {c.get('to_period')} "
-            f"= {c.get('income_growth_pct'):.1f}% "
-            f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
-        )
+        if c.get("comparison") in ("yearly_income_growth", "quarterly_income_growth"):
+            from_label = c.get("from_year") or c.get("from_quarter")
+            to_label = c.get("to_year") or c.get("to_quarter")
+            pct = c.get("income_growth_pct")
+            pct_txt = f"{pct:.1f}%" if pct is not None else "N/A"
+            header += (
+                f"Computed: income growth {from_label} → {to_label} = {pct_txt} "
+                f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
+            )
+        else:
+            header += (
+                f"Computed: income growth from {c.get('from_period')} to {c.get('to_period')} "
+                f"= {c.get('income_growth_pct'):.1f}% "
+                f"(£{c.get('income_from', 0):,.0f} → £{c.get('income_to', 0):,.0f})\n"
+            )
     context = header + "\n" + context
 
     history_block = format_history_for_prompt(chat_history)
