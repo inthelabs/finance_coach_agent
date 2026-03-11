@@ -23,6 +23,7 @@ mymlprof/
 
 #COLLABS
 *.ipynb
+*.gsheet
 
 requirements_bk.txt
 
